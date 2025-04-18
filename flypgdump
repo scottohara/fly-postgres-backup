@@ -1,0 +1,109 @@
+#!/bin/bash
+
+set -e
+
+# Timestamp for the dump file name
+FILE_SUFFIX="$(date +"%Y-%m-%d-%H%M%S")"
+
+# Check required environment variables
+ALL_REQUIRED_ENV_VARS_PROVIDED=1
+
+declare -A REQUIRED_ENV_VARS=(
+	["FILE_PREFIX"]="Prefix for the name of the backup file (Example: 'FILE_PREFIX=foo' would generate a backup file named 'foo-$FILE_SUFFIX.dump')"
+	["FLY_ACCESS_TOKEN"]="Credentials used by the fly proxy command"
+	["FLY_APP"]="fly postgres app containing the database to backup"
+	["PGVERSION"]="Postgres version"
+	["PGDATABASE"]="Postgres database to backup"
+	["PGUSER"]="Postgres user name"
+	["PGPASSWORD"]="Postgres password"
+)
+
+for var in "${!REQUIRED_ENV_VARS[@]}"; do
+	if [ -z "${!var}" ]; then
+		echo "[ERROR: MISSING ENV VAR] $var : ${REQUIRED_ENV_VARS[$var]}"
+		ALL_REQUIRED_ENV_VARS_PROVIDED=0
+	fi
+done	
+
+[ "$ALL_REQUIRED_ENV_VARS_PROVIDED" -eq 0 ] && exit 1
+
+# Backup settings
+FILENAME="$FILE_PREFIX-$FILE_SUFFIX.dump"
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+stop_flyproxy() {
+	echo
+	echo "Stopping flyproxy..."
+	docker stop flyproxy > /dev/null
+
+	if [ -n "$DOCKER_LOGS_PID" ]; then
+		kill "$DOCKER_LOGS_PID" 2>/dev/null || true
+	fi
+}
+
+# Start flyproxy
+echo
+echo "Starting flyproxy..."
+docker run \
+--rm \
+--tty \
+--detach \
+--env FLY_ACCESS_TOKEN=$FLY_ACCESS_TOKEN \
+--env FLY_APP=$FLY_APP \
+--network flypostgres \
+--name flyproxy \
+flyio/flyctl proxy --quiet --bind-addr 0.0.0.0 15432:5432 > /dev/null
+
+trap stop_flyproxy EXIT
+
+# Wait for flyproxy to be ready
+docker logs --follow flyproxy &
+DOCKER_LOGS_PID=$!
+TIMEOUT=30
+WAIT_TIME=0
+until docker logs flyproxy | grep --quiet "Proxying local port"; do
+	if [ "$WAIT_TIME" -ge "$TIMEOUT" ]; then
+		echo "Timeout waiting for flyproxy to be ready." >&2
+		exit 1
+	fi
+	sleep 1
+	WAIT_TIME=$((WAIT_TIME + 1))
+done
+kill "$DOCKER_LOGS_PID" 2>/dev/null || true
+
+# Run pg_dump
+echo
+echo "Dumping database..."
+docker run \
+--rm \
+--tty \
+--env PGHOST=flyproxy \
+--env PGPORT=15432 \
+--env PGDATABASE=$PGDATABASE \
+--env PGUSER=$PGUSER \
+--env PGPASSWORD=$PGPASSWORD \
+--network flypostgres \
+--volume "$SCRIPT_DIR":/pgdump \
+--name "pg_dump$PGVERSION" \
+postgres:$PGVERSION-alpine pg_dump --format=custom --file="/pgdump/$FILENAME"
+
+# Touch the newly created file so that Cloud Sync gets an inotify event
+touch "$SCRIPT_DIR/$FILENAME"
+
+echo "Finished"
+
+# Keep the last 30 backups
+cd "$SCRIPT_DIR"
+MAX_FILES=30
+
+FILE_COUNT=$(ls -1 $FILE_PREFIX* | wc -l)
+
+if [ "$FILE_COUNT" -gt "$MAX_FILES" ]; then
+  echo
+  echo "Removing old backups (keeping 30 most recent)..."
+  ls -1t $FILE_PREFIX* | tail -n +$((MAX_FILES + 1)) | xargs rm
+fi
+
+echo
+echo "Retained backups:"
+ls -lht $FILE_PREFIX* | awk '{print $9, $5}' | nl -w 1 -s '. '
