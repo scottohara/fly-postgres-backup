@@ -6,6 +6,8 @@
 
 - Intended to be run daily via a cron job or other scheduling tool.
 
+[![Maintainability](https://qlty.sh/gh/scottohara/projects/fly-postgres-backup/maintainability.svg)](https://qlty.sh/gh/scottohara/projects/fly-postgres-backup)
+
 # Background
 
 Fly.io offers a way to run a Postgres cluster, but they go to great lengths to make it very clear that [this is not managed postgres](https://fly.io/docs/postgres/getting-started/what-you-should-know/).
